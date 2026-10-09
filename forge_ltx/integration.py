@@ -270,18 +270,17 @@ def postprocess(p, processed):
 
 
 def _write_output(p, processed, request, generation):
-    import numpy as np
     import torch
     from modules import shared
     from PIL import Image
 
-    pixels = generation.decoded.clamp(0, 1).mul(255).round().to(torch.uint8)
-    frames = [Image.fromarray(np.moveaxis(frame.numpy(), 0, 2)) for frame in pixels]
+    # [T, H, W, 3] uint8, the form FFmpeg reads
+    frames = generation.decoded.clamp(0, 1).mul(255).round().to(torch.uint8).permute(0, 2, 3, 1).contiguous().numpy()
     infotext = processed.infotexts[0] if processed.infotexts else processed.info
     directory = Path(p.outpath_samples or shared.opts.outdir_samples or "outputs/ltx").resolve()
     stem = f"ltx-{generation.seed}-{uuid.uuid4().hex[:12]}"
     if request.output == "Still image":
-        output = export_still(frames[0], directory / f"{stem}.png", infotext)
+        output = export_still(Image.fromarray(frames[0]), directory / f"{stem}.png", infotext)
     else:
         audio = generation.waveform if request.include_audio else None
         output = export_video(frames, audio, directory / f"{stem}.mp4", fps=request.fps, sample_rate=generation.sample_rate,
