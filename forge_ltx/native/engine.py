@@ -7,6 +7,8 @@ streams, keeps the frames and the waveform for the script, and hands Forge the f
 """
 
 import contextlib
+import logging
+import os
 
 import torch
 from backend import memory_management
@@ -26,9 +28,15 @@ TEXT_MEMORY_PER_TOKEN = 3 * 1024 * 1024
 MIN_TEXT_TOKENS = 642
 # ComfyUI's estimate for the audio VAE and the vocoder (sd.py, "LTX Audio"), per latent element in fp32
 AUDIO_MEMORY_PER_ELEMENT = 87000 * 4
-# tiled video decode, in latent units: ComfyUI's LTX tiled decode uses 512-pixel tiles with 64 pixels of overlap
+# tiled video decode, in latent units: ComfyUI's LTX tiled decode uses 512-pixel tiles with 64 pixels of overlap;
+# smaller tiles when even those do not fit the card
 DECODE_TILE = 16
+DECODE_TILES = (16, 12, 8, 6)
 DECODE_TILE_OVERLAP = 2
+# LTX_DEBUG_MEMORY=1 in Forge's environment prints the working memory each stage really took (CUDA only)
+DEBUG_MEMORY = bool(os.environ.get("LTX_DEBUG_MEMORY"))
+
+logger = logging.getLogger("forge_ltx")
 
 
 def encode_memory(pixel_shape, dtype) -> int:
@@ -51,14 +59,33 @@ def video_vae_patcher(model, dtype) -> VAE:
     vae.upscale_index_formula = (8, 32, 32)
     vae.downscale_ratio = (lambda a: max(0, (a + 7) // 8), 32, 32)
     vae.downscale_index_formula = (8, 32, 32)
-    vae.memory_used_decode = lambda shape, dtype: model.decode_memory(shape, dtype, vae.device)
+    # Forge's tiled decode reserves memory for the shape it is given; with a tile set, for one tile
+    vae.ltx_tile = None
+    vae.memory_used_decode = lambda shape, dtype: model.decode_memory(_tile_shape(shape, vae.ltx_tile), dtype, vae.device)
     return vae
+
+
+def _tile_shape(shape, tile):
+    if tile is None:
+        return tuple(shape)
+    side = tile + 2 * DECODE_TILE_OVERLAP
+    return (*shape[:3], min(shape[3], side), min(shape[4], side))
+
+
+def decode_plan(model, shape, dtype, room: int) -> int | None:
+    """None when the whole clip fits in room bytes of working memory, else the largest tile (in latent units) that does."""
+    if model.decode_memory(shape, dtype, None) <= room:
+        return None
+    for tile in DECODE_TILES:
+        if model.decode_memory(_tile_shape(shape, tile), dtype, None) <= room:
+            return tile
+    return DECODE_TILES[-1]
 
 
 @contextlib.contextmanager
 def _peak_memory(stage: str, device: torch.device, reserved: int):
-    """Logs the working memory a stage really took on a CUDA device, next to what was reserved for it."""
-    if getattr(device, "type", None) != "cuda":
+    """With LTX_DEBUG_MEMORY, logs the working memory a stage really took on a CUDA device, next to what was reserved."""
+    if not DEBUG_MEMORY or getattr(device, "type", None) != "cuda":
         yield
         return
     torch.cuda.synchronize(device)
@@ -176,36 +203,58 @@ class LTXEngine(ForgeDiffusionEngine):
         self.first_frame = x[:1].float().mul(0.5).add(0.5).clamp(0.0, 1.0).movedim(1, -1).cpu()
         return torch.zeros((1, 1, 1, 1), device=x.device)
 
-    def _decode_video(self, video: torch.Tensor) -> torch.Tensor:
-        """Frames [T, 3, H, W] in [0, 1] from the video latent. The whole clip at once, streaming through time; Never
-        OOM's "always tiled" VAE switch, or running out of memory twice, takes Forge's own tiled decode instead."""
+    def _decode_room(self) -> int | None:
+        """Working memory the video decode can have on its device once every other model has left; None off CUDA."""
         video_vae = self.forge_objects.vae
+        if getattr(video_vae.device, "type", None) != "cuda":
+            return None
+        total = memory_management.get_total_memory(video_vae.device)
+        return int(total - video_vae.patcher.model_size() - memory_management.minimum_inference_memory())
+
+    def _decode_video(self, video: torch.Tensor) -> torch.Tensor:
+        """Frames [T, 3, H, W] in [0, 1] from the video latent.
+
+        The whole clip at once, streaming through time, with its working memory reserved (Forge moves the DiT and the
+        text encoder out as far as needed). When even the whole card cannot hold that, or Never OOM's VAE switch is on,
+        Forge's own tiled decode runs with the largest tile that fits. Running out of memory anyway (the estimate is
+        calibrated on one card) unloads the other models and tries again, then goes tiled: all of it quietly."""
+        video_vae = self.forge_objects.vae
+        model, dtype = video_vae.first_stage_model, video_vae.vae_dtype
+        room = self._decode_room()
+        tile = None if room is None else decode_plan(model, video.shape, dtype, room)
         if memory_management.VAE_ALWAYS_TILED:
-            return self._decode_tiled(video)
-        reserve = video_vae.first_stage_model.decode_memory(video.shape, video_vae.vae_dtype, video_vae.device)
+            tile = tile or DECODE_TILE
+        if tile is not None:
+            return self._decode_tiled(video, tile)
+
+        reserve = model.decode_memory(video.shape, dtype, video_vae.device)
         for attempt in range(2):
             try:
                 memory_management.load_models_gpu([video_vae.patcher], memory_required=reserve)
                 with _peak_memory("video decode", video_vae.device, reserve):
-                    pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))  # [1, 3, T, H, W] in [-1, 1]
+                    pixels = model.decode(video.to(video_vae.device, dtype))  # [1, 3, T, H, W] in [-1, 1]
                 return pixels[0].float().add(1.0).mul(0.5).clamp(0.0, 1.0).cpu().movedim(1, 0)
             except Exception as e:
                 if not memory_management.is_oom(e):
                     raise
                 pixels = None
                 memory_management.soft_empty_cache(force=True)
+                logger.debug("[LTX] video decode out of memory with %.2f GiB reserved (attempt %d)", reserve / 2**30, attempt + 1)
                 if attempt == 0:
-                    # the estimate fell short: the DiT and the text encoder leave VRAM (they reload from their files)
-                    print(f"[LTX] video decode ran out of memory with {reserve / 2**30:.2f} GiB reserved: retrying with the other models unloaded")
                     memory_management.unload_all_models()
-                    reserve *= 2
-        print("[LTX] video decode ran out of memory again: decoding in tiles")
-        return self._decode_tiled(video)
+                    reserve = max(reserve * 2, room or 0)
+        return self._decode_tiled(video, DECODE_TILES[-1] if room is not None else DECODE_TILE)
 
-    def _decode_tiled(self, video: torch.Tensor) -> torch.Tensor:
+    def _decode_tiled(self, video: torch.Tensor, tile: int = DECODE_TILE) -> torch.Tensor:
         video_vae = self.forge_objects.vae
-        print(f"[LTX] video decode in tiles of {DECODE_TILE * 32} pixels")
-        frames = video_vae.decode_tiled(video, tile_x=DECODE_TILE, tile_y=DECODE_TILE, overlap=DECODE_TILE_OVERLAP)  # [1, T, H, W, 3] in [0, 1]
+        logger.debug("[LTX] video decode in tiles of %d pixels", tile * 32)
+        video_vae.ltx_tile = tile
+        try:
+            with _peak_memory(f"video decode in {tile * 32}-pixel tiles", video_vae.device,
+                              video_vae.memory_used_decode(video.shape, video_vae.vae_dtype)):
+                frames = video_vae.decode_tiled(video, tile_x=tile, tile_y=tile, overlap=DECODE_TILE_OVERLAP)  # [1, T, H, W, 3] in [0, 1]
+        finally:
+            video_vae.ltx_tile = None
         return frames[0].float().clamp(0.0, 1.0).cpu().movedim(-1, 1)
 
     @torch.inference_mode()

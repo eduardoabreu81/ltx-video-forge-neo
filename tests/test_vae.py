@@ -117,14 +117,28 @@ class ForwardTests(unittest.TestCase):
         with torch.inference_mode():  # as decode_first_stage runs
             plain = model.decode(latent.clone())[0].add(1.0).mul(0.5).clamp(0.0, 1.0).movedim(1, 0)
             owner = types.SimpleNamespace(forge_objects=types.SimpleNamespace(vae=vae))
-            with mock.patch.object(engine, "DECODE_TILE", 8), mock.patch.object(engine, "DECODE_TILE_OVERLAP", 1):
-                whole = engine.LTXEngine._decode_tiled(owner, latent.clone())
-            with mock.patch.object(engine, "DECODE_TILE", 3), mock.patch.object(engine, "DECODE_TILE_OVERLAP", 1):
-                tiled = engine.LTXEngine._decode_tiled(owner, latent.clone())
+            with mock.patch.object(engine, "DECODE_TILE_OVERLAP", 1):
+                whole = engine.LTXEngine._decode_tiled(owner, latent.clone(), 8)
+                tiled = engine.LTXEngine._decode_tiled(owner, latent.clone(), 3)
         self.assertEqual(tuple(whole.shape), (17, 3, 128, 192))
         torch.testing.assert_close(whole, plain, rtol=1e-4, atol=1e-4)
         self.assertEqual(tiled.shape, whole.shape)
         self.assertTrue(torch.isfinite(tiled).all())
+
+    def test_decode_plan_fits_the_card(self):
+        # the whole clip when the card holds it, else the largest tile that fits; 1280x704x121 needs about 8.5 GiB
+        from forge_ltx.native import engine
+        with using_forge_operations(device=torch.device("meta"), dtype=torch.bfloat16):
+            model = video_vae.VideoVAE(self.reference["video"]["2.5"]["config"])
+        shape, gib = (1, 128, 16, 22, 40), 1024**3
+        self.assertIsNone(engine.decode_plan(model, shape, torch.bfloat16, 44 * gib))   # A40 / 48 GB
+        self.assertIsNone(engine.decode_plan(model, shape, torch.bfloat16, 13 * gib))   # 16 GB card
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 6 * gib), 16)  # 8 GB card
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 3 * gib), 8)
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 2 * gib), 6)
+        for tile in engine.DECODE_TILES:
+            self.assertLessEqual(model.decode_memory(engine._tile_shape(shape, tile), torch.bfloat16, None),
+                                 model.decode_memory(shape, torch.bfloat16, None))
 
     def test_audio_matches_comfyui(self):
         for version, stored in self.reference["audio"].items():
