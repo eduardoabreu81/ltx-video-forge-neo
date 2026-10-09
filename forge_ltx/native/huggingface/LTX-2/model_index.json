@@ -1,0 +1,20 @@
+{
+  "_class_name": "LTXAVPipeline",
+  "_diffusers_version": "0.37.0",
+  "scheduler": [
+    "diffusers",
+    "FlowMatchEulerDiscreteScheduler"
+  ],
+  "text_encoder": [
+    "transformers",
+    "LTXGemmaTextEncoder"
+  ],
+  "transformer": [
+    "diffusers",
+    "LTXAVTransformer3DModel"
+  ],
+  "vae": [
+    "diffusers",
+    "AutoencoderLTXAV"
+  ]
+}

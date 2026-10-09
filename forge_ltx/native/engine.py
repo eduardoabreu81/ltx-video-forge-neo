@@ -1,0 +1,106 @@
+"""LTX-2.x diffusion engine for Forge Neo: text-to-video with audio.
+
+Video [1, 128, F, H/32, W/32] and audio [1, 8, T, 16] latents travel through Forge's sampler packed into one flat
+tensor [1, 1, 1, N], as ComfyUI does (comfy.utils.pack_latents). The script sets up a generation with prepare(), which
+returns the packed shape; the transformer unpacks it every step (forge_dit.py); decode_first_stage decodes both
+streams, keeps the frames and the waveform for the script, and hands Forge the first frame.
+"""
+
+import torch
+from backend import memory_management
+from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
+from backend.patcher.clip import CLIP
+from backend.patcher.unet import UnetPatcher
+from backend.patcher.vae import VAE
+
+from ..contracts import raise_pending_error
+from .model import LTXAV, TEXT_ENCODER
+from .streams import Generation, stream_shapes
+from .text_engine import LTXTextEngine
+
+# ComfyUI's estimate of the text encoder's working memory: per token, half of it in 16-bit (lt.memory_estimation_function)
+TEXT_MEMORY_PER_TOKEN = 3 * 1024 * 1024
+MIN_TEXT_TOKENS = 642
+
+
+def _video_vae_dtype() -> torch.dtype:
+    # ComfyUI runs the LTX video VAE in bf16 or fp32
+    return memory_management.vae_dtype(allowed_dtypes=[torch.bfloat16, torch.float32])
+
+
+class LTXEngine(ForgeDiffusionEngine):
+    matched_guesses = [LTXAV]
+
+    def __init__(self, estimated_config, huggingface_components):
+        super().__init__(estimated_config, huggingface_components)
+
+        text_encoder = huggingface_components["text_encoder"]
+        clip = CLIP(model_dict={TEXT_ENCODER: text_encoder}, tokenizer_dict={TEXT_ENCODER: text_encoder.ltx_tokenizer})
+
+        pair = huggingface_components["vae"]
+        vae = VAE(model=pair.video, dtype=_video_vae_dtype(), is_wan=True)
+        vae.latent_channels = 128
+        # the audio VAE and the vocoder in fp32, as ComfyUI keeps them
+        self.audio_vae = VAE(model=pair.audio, dtype=torch.float32, is_wan=True)
+
+        unet = UnetPatcher.from_model(model=huggingface_components["transformer"], diffusers_scheduler=None,
+                                      k_predictor=self._get_predictor(), config=estimated_config)
+
+        self.text_processing_engine_ltx = LTXTextEngine(getattr(clip.cond_stage_model, TEXT_ENCODER), text_encoder.ltx_tokenizer,
+                                                        text_encoder.text_embedding_projection)
+
+        self.forge_objects = ForgeObjects(unet=unet, clip=clip, vae=vae, clipvision=None)
+        self.forge_objects_original = self.forge_objects.shallow_copy()
+        self.forge_objects_after_applying_lora = self.forge_objects.shallow_copy()
+
+        self.is_ltx = True
+        self.ltx_version = estimated_config.unet_config.get("version", "2.5")
+        self.generation: Generation | None = None
+
+    def prepare(self, frames: int, width: int, height: int, fps: float, seed: int) -> tuple[int, ...]:
+        """Start a generation: remember its shapes; returns the shape of the packed latent (without the batch)."""
+        shapes = stream_shapes(frames, width, height, fps)
+        self.generation = Generation(shapes=shapes, seed=seed, fps=float(fps), frames=frames)
+        self.forge_objects.unet.model.diffusion_model.generation = self.generation
+        return (1, 1, shapes.size)
+
+    def release_generation(self) -> None:
+        """Drop the decoded frames and waveform once the script has written them."""
+        self.generation = None
+        self.forge_objects.unet.model.diffusion_model.generation = None
+
+    @torch.inference_mode()
+    def get_learned_conditioning(self, prompt: list[str]):
+        raise_pending_error()
+        tokens = max([MIN_TEXT_TOKENS] + [len(self.text_processing_engine_ltx.tokenize(text)) + 1 for text in prompt])
+        memory_management.load_models_gpu([self.forge_objects.clip.patcher], memory_required=tokens * TEXT_MEMORY_PER_TOKEN)
+        return self.text_processing_engine_ltx(prompt)
+
+    @torch.inference_mode()
+    def get_prompt_lengths_on_ui(self, prompt: str) -> tuple[int, int]:
+        token_count = len(self.text_processing_engine_ltx.tokenize(prompt))
+        return token_count, max(1024, token_count)
+
+    @torch.inference_mode()
+    def encode_first_stage(self, x: torch.Tensor):
+        raise_pending_error()
+        raise RuntimeError("[LTX] image-to-video is not available yet: use txt2img")
+
+    @torch.inference_mode()
+    def decode_first_stage(self, x: torch.Tensor):
+        generation = self.generation
+        if generation is None or x.shape[-1] != generation.shapes.size:
+            raise RuntimeError("[LTX] the latent does not belong to the current LTX generation")
+        video, audio = generation.shapes.unpack(x[:1].float())
+
+        video_vae = self.forge_objects.vae
+        memory_management.load_model_gpu(video_vae.patcher)
+        pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))  # [1, 3, F, H, W] in [-1, 1]
+        generation.decoded = pixels[0].float().add(1.0).mul(0.5).clamp(0.0, 1.0).cpu().movedim(1, 0)
+
+        memory_management.load_model_gpu(self.audio_vae.patcher)
+        audio_model = self.audio_vae.first_stage_model
+        generation.waveform = audio_model.decode(audio.to(self.audio_vae.device, torch.float32))[0].float().cpu()
+        generation.sample_rate = audio_model.output_sample_rate
+
+        return generation.decoded[:1].mul(2.0).sub(1.0)
