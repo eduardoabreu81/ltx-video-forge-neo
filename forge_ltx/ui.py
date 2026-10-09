@@ -16,6 +16,8 @@ from .contracts import (
 from .integration import checkpoint_info
 from .models import ROLE_LABELS, inspect_model
 from .ui_state import duration_text, frame_view, preset_frame_view
+from .upscalers import AUTOMATIC
+from .upscalers import names as upscaler_names
 
 COMPONENTS = {}
 NATIVE_CONTROLS = ("batch_size", "batch_count", "sampling", "scheduler", "cfg_scale", "steps")
@@ -55,6 +57,13 @@ class Panel:
                 self.audio = gr.Checkbox(value=True, label="Include generated audio", elem_id=f"{self.tab}_ltx_audio")
                 self.fps = gr.Slider(minimum=MIN_FPS, maximum=MAX_FPS, step=1, value=DEFAULT_FPS, label="FPS",
                                      elem_id=f"{self.tab}_ltx_fps")
+            with gr.Row():
+                self.two_stage = gr.Checkbox(value=False, label="Two stages (half size, then latent upscale x2)",
+                                             elem_id=f"{self.tab}_ltx_two_stage")
+                self.upscaler = gr.Dropdown(choices=self._upscalers(), value=AUTOMATIC, label="Latent upscaler",
+                                            elem_id=f"{self.tab}_ltx_upscaler")
+                self.refresh = gr.Button(value="\U0001f504", elem_id=f"{self.tab}_ltx_upscaler_refresh", elem_classes=["tool"])
+                self.refresh.click(lambda: gr.update(choices=self._upscalers()), outputs=[self.upscaler], queue=False, show_progress=False)
             with gr.Accordion("First and last frame", open=False):
                 gr.Markdown("In img2img the input image is the first frame; the gallery of ImageStitch Integrated "
                             "holds the last frame (in txt2img or img2img).")
@@ -70,10 +79,17 @@ class Panel:
         self.attempts = []
         PANELS.append(self)
 
+    @staticmethod
+    def _upscalers():
+        try:
+            return [AUTOMATIC] + upscaler_names()
+        except Exception:
+            return [AUTOMATIC]
+
     @property
     def inputs(self):
         # the order integration.script_before_process takes
-        return [self.output, self.audio, self.fps, self.strength, self.compression]
+        return [self.output, self.audio, self.fps, self.strength, self.compression, self.two_stage, self.upscaler]
 
     @property
     def needed(self):

@@ -4,6 +4,10 @@ Video [1, 128, F, H/32, W/32] and audio [1, 8, T, 16] latents travel through For
 tensor [1, 1, 1, N], as ComfyUI does (comfy.utils.pack_latents). The script sets up a generation with prepare(), which
 returns the packed shape; the transformer unpacks it every step (forge_dit.py); decode_first_stage decodes both
 streams, keeps the frames and the waveform for the script, and hands Forge the first frame.
+
+Two stages (ComfyUI's LTX templates): the first generation runs at half the output size; refine_start() upscales its
+video latent x2 with the latent upscaler (upsampler.py) and sets up the second generation at the output size, which
+the script samples from there on the refining sigmas.
 """
 
 import contextlib
@@ -13,12 +17,13 @@ import os
 import torch
 from backend import memory_management
 from backend.diffusion_engine.base import ForgeDiffusionEngine, ForgeObjects
+from backend.patcher.base import ModelPatcher
 from backend.patcher.clip import CLIP
 from backend.patcher.unet import UnetPatcher
 from backend.patcher.vae import VAE
 
 from ..contracts import keyframe_defaults, raise_pending_error
-from . import guides
+from . import guides, upsampler
 from .model import LTXAV, TEXT_ENCODER
 from .streams import Generation, stream_shapes
 from .text_engine import LTXTextEngine
@@ -33,6 +38,8 @@ AUDIO_MEMORY_PER_ELEMENT = 87000 * 4
 DECODE_TILE = 16
 DECODE_TILES = (16, 12, 8, 6)
 DECODE_TILE_OVERLAP = 2
+# ComfyUI's estimate for the latent upscaler, per input latent element (LTXVLatentUpsampler)
+UPSCALE_MEMORY_PER_ELEMENT = 3000
 # LTX_DEBUG_MEMORY=1 in Forge's environment prints the working memory each stage really took (CUDA only)
 DEBUG_MEMORY = bool(os.environ.get("LTX_DEBUG_MEMORY"))
 
@@ -129,6 +136,8 @@ class LTXEngine(ForgeDiffusionEngine):
         self.first_frame: torch.Tensor | None = None
         self.last_frame: torch.Tensor | None = None
         self.keyframe_strength, self.keyframe_compression = keyframe_defaults(self.ltx_version)
+        # the latent upscaler of two-stage generations, (path, patcher) of the last one used
+        self._upscaler: tuple[str, ModelPatcher] | None = None
 
     def set_keyframes(self, last_frame: torch.Tensor | None = None, strength: float | None = None, compression: int | None = None) -> None:
         """Called by the script for every generation, before Forge's img2img init calls encode_first_stage."""
@@ -138,45 +147,94 @@ class LTXEngine(ForgeDiffusionEngine):
         self.keyframe_strength = default_strength if strength is None else float(strength)
         self.keyframe_compression = default_compression if compression is None else int(compression)
 
-    def keyframes(self) -> list[guides.Keyframe]:
+    def keyframes(self, refine: bool = False) -> list[guides.Keyframe]:
         """The conditioning images of the next generation: the first frame in place alone, appended guides at the first
-        and the last frame together (the ComfyUI image-to-video and first-last-frame templates)."""
+        and the last frame together (the ComfyUI image-to-video and first-last-frame templates). The second stage of
+        the image-to-video template holds the first frame at full strength."""
         strength = self.keyframe_strength
         if self.first_frame is not None and self.last_frame is None:
-            return [guides.Keyframe(self.first_frame, 0, strength, in_place=True)]
+            return [guides.Keyframe(self.first_frame, 0, 1.0 if refine else strength, in_place=True)]
         return [guides.Keyframe(image, frame, strength) for image, frame in ((self.first_frame, 0), (self.last_frame, -1))
                 if image is not None]
 
     @torch.inference_mode()
-    def _encode_keyframes(self, keyframes: list[guides.Keyframe]) -> list[torch.Tensor]:
-        # each image on its own, one latent frame [1, 128, 1, H/32, W/32]
+    def _encode_keyframes(self, keyframes: list[guides.Keyframe], height: int, width: int) -> list[torch.Tensor]:
+        # each image on its own, one latent frame [1, 128, 1, H/32, W/32]; compressed at its own size, then fitted to
+        # the generation's (LTXVPreprocess, then the conditioning node's resize)
         video_vae = self.forge_objects.vae
-        largest = max(keyframes, key=lambda k: k.image.shape[1] * k.image.shape[2]).image
-        memory_management.load_models_gpu([video_vae.patcher], memory_required=encode_memory((1, 3, 1, *largest.shape[1:3]), video_vae.vae_dtype))
+        memory_management.load_models_gpu([video_vae.patcher], memory_required=encode_memory((1, 3, 1, height, width), video_vae.vae_dtype))
         latents = []
         for keyframe in keyframes:
             image = guides.compress(keyframe.image[0].float(), self.keyframe_compression)
+            image = guides.fit(image[None], height, width)[0]
             pixels = image.movedim(-1, 0)[None, :, None].mul(2.0).sub(1.0)  # [1, 3, 1, H, W] in [-1, 1]
             latent = video_vae.first_stage_model.encode(pixels.to(video_vae.device, video_vae.vae_dtype), device=video_vae.device)
             latents.append(latent.float().cpu())
         return latents
 
-    def prepare(self, frames: int, width: int, height: int, fps: float, seed: int) -> tuple[int, ...]:
-        """Start a generation: remember its shapes and encode its keyframes; returns the shape of the packed latent
-        (without the batch)."""
-        keyframes = self.keyframes()
-        for keyframe in keyframes:
-            if tuple(keyframe.image.shape[1:3]) != (height, width):
-                raise RuntimeError(f"[LTX] a keyframe is {keyframe.image.shape[2]}x{keyframe.image.shape[1]}, not the output size {width}x{height}")
+    def prepare(self, frames: int, width: int, height: int, fps: float, seed: int, refine: bool = False) -> tuple[int, ...]:
+        """Start a generation of width x height (the output size, or half of it for the first of two stages): remember
+        its shapes and encode its keyframes; returns the shape of the packed latent (without the batch)."""
+        keyframes = self.keyframes(refine)
         guide_frames = sum(1 for k in keyframes if not k.in_place)
         shapes = stream_shapes(frames, width, height, fps, guide_frames)
         conditioning = None
         if keyframes:
             video_shape = (1, shapes.video[1], shapes.video[2] - guide_frames, *shapes.video[3:])
-            conditioning = guides.build(video_shape, frames, keyframes, self._encode_keyframes(keyframes))
+            conditioning = guides.build(video_shape, frames, keyframes, self._encode_keyframes(keyframes, height, width))
         self.generation = Generation(shapes=shapes, seed=seed, fps=float(fps), frames=frames, conditioning=conditioning)
         self.forge_objects.unet.model.diffusion_model.generation = self.generation
         return (1, 1, shapes.size)
+
+    def _upscaler_patcher(self, path: str) -> ModelPatcher:
+        if self._upscaler is not None and self._upscaler[0] == path:
+            return self._upscaler[1]
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+
+        with safe_open(path, framework="pt") as f:
+            config = upsampler.config_from_metadata(f.metadata())
+        if not upsampler.is_spatial_x2(config):
+            raise RuntimeError("[LTX] two stages need a spatial x2 latent upscaler (ltx-*-spatial-upscaler-x2)")
+        state_dict = load_file(path)
+        if not upsampler.is_upsampler(state_dict):
+            raise RuntimeError(f"[LTX] {os.path.basename(path)} is not an LTX latent upscaler")
+        self._upscaler = None
+        model = upsampler.LatentUpsampler.from_config(config)
+        model.load_state_dict(state_dict, strict=True)
+        model = model.to(_video_vae_dtype()).eval().requires_grad_(False)
+        patcher = ModelPatcher(model, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
+        self._upscaler = (path, patcher)
+        return patcher
+
+    @torch.inference_mode()
+    def upscale(self, video: torch.Tensor, path: str) -> torch.Tensor:
+        """The normalized video latent [1, 128, F, H, W] at twice the size, through the latent upscaler, which works
+        on un-normalized latents (ComfyUI LTXVLatentUpsampler)."""
+        patcher = self._upscaler_patcher(path)
+        memory_management.load_models_gpu([patcher], memory_required=video.numel() * UPSCALE_MEMORY_PER_ELEMENT)
+        model = patcher.model
+        statistics = self.forge_objects.vae.first_stage_model.per_channel_statistics
+        x = statistics.un_normalize(video.to(patcher.load_device, next(model.parameters()).dtype))
+        return statistics.normalize(model(x)).float().cpu()
+
+    @torch.inference_mode()
+    def refine_start(self, samples: torch.Tensor, width: int, height: int, upscaler_path: str) -> torch.Tensor:
+        """After the first stage: its video latent upscaled x2 and the second generation set up at width x height, with
+        the keyframes encoded again at that size; returns the packed latent the second stage starts from (the audio
+        latent carries over)."""
+        generation = self.generation
+        video, audio = generation.shapes.unpack(samples[:1].float().cpu())
+        if generation.conditioning is not None and generation.conditioning.guide_frames:
+            video = video[:, :, :video.shape[2] - generation.conditioning.guide_frames]
+        video = self.upscale(video, upscaler_path)
+        self.prepare(generation.frames, width, height, generation.fps, generation.seed, refine=True)
+        refined = self.generation
+        if refined.conditioning is not None:
+            video = refined.conditioning.place(video)
+        if tuple(video.shape) != refined.shapes.video:
+            raise RuntimeError(f"[LTX] the upscaled latent is {tuple(video.shape)}, not {refined.shapes.video}")
+        return refined.shapes.pack(video, audio)
 
     def release_generation(self) -> None:
         """Drop the decoded frames and waveform, and the keyframes, once the script has written them."""

@@ -53,6 +53,21 @@ def compress(image: torch.Tensor, crf: int) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(decoded)).to(image.dtype) / 255.0
 
 
+def fit(image: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """(1, H, W, 3) at another size, as ComfyUI's LTX conditioning nodes resize their image (common_upscale, bilinear,
+    center crop): the first stage of a two-stage generation works at half the output size."""
+    if tuple(image.shape[1:3]) == (height, width):
+        return image
+    x = image.movedim(-1, 1)
+    old_h, old_w = x.shape[2], x.shape[3]
+    old_aspect, new_aspect = old_w / old_h, width / height
+    left = round((old_w - old_w * (new_aspect / old_aspect)) / 2) if old_aspect > new_aspect else 0
+    top = round((old_h - old_h * (old_aspect / new_aspect)) / 2) if old_aspect < new_aspect else 0
+    x = x[:, :, top:old_h - top, left:old_w - left]
+    x = torch.nn.functional.interpolate(x.float(), size=(height, width), mode="bilinear")
+    return x.movedim(1, -1).to(image.dtype)
+
+
 @dataclass
 class Keyframe:
     """One conditioning image: (1, H, W, 3) float in [0, 1] at the output size, the pixel frame it stands for (0 or
@@ -80,6 +95,15 @@ class Conditioning:
     def mix(self, video: torch.Tensor) -> torch.Tensor:
         """The sampler's latent with the conditioned frames pulled to their clean latent (KSamplerX0Inpaint)."""
         return video * self.mask + self.latent * (1.0 - self.mask)
+
+    def place(self, video: torch.Tensor) -> torch.Tensor:
+        """A start latent with the clean latents in the conditioned frames, as ComfyUI's LTXVImgToVideoInplace and
+        LTXVAddGuide leave them in the latent a sampler starts from; video holds the clip's frames, without guides."""
+        guides = self.latent.shape[2] - video.shape[2]
+        if guides:
+            video = torch.cat([video, video.new_zeros((*video.shape[:2], guides, *video.shape[3:]))], dim=2)
+        held = (self.mask < 1.0).to(video.dtype)
+        return video * (1.0 - held) + self.latent.to(video) * held
 
     def timesteps(self, sigma: torch.Tensor) -> torch.Tensor:
         """Per-token video timesteps [B, tokens]: sigma * mask (LTXAV.process_timestep)."""

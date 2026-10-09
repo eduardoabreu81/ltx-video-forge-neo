@@ -10,6 +10,8 @@ MAX_FRAMES = 1001
 DEFAULT_FRAMES = 121
 STILL_FRAMES = 1
 SIZE_STEP = 32
+# two stages: the first one runs at half the output size, which must stay a multiple of 32
+TWO_STAGE_SIZE_STEP = 64
 MIN_SIZE = 64
 # the frame rate the DiT is told (ComfyUI LTXVConditioning); the templates use 24, LTX-2.5 goes up to 50
 DEFAULT_FPS = 24
@@ -68,6 +70,8 @@ class GenerationRequest:
     fps: int = DEFAULT_FPS
     output: str = "Video"
     include_audio: bool = True
+    # generate at half the size, upscale the latent x2 and refine it (the ComfyUI LTX templates)
+    two_stage: bool = False
 
     def __post_init__(self):
         if self.output not in ("Video", "Still image"):
@@ -76,6 +80,9 @@ class GenerationRequest:
         self.height = integer(self.height, "Height")
         if min(self.width, self.height) < MIN_SIZE or self.width % SIZE_STEP or self.height % SIZE_STEP:
             raise LTXError(f"LTX width and height must be multiples of {SIZE_STEP}, at least {MIN_SIZE}.")
+        self.two_stage = bool(self.two_stage)
+        if self.two_stage and (self.width % TWO_STAGE_SIZE_STEP or self.height % TWO_STAGE_SIZE_STEP or min(self.width, self.height) < 2 * MIN_SIZE):
+            raise LTXError(f"With two stages, LTX width and height must be multiples of {TWO_STAGE_SIZE_STEP}, at least {2 * MIN_SIZE}.")
         self.fps = integer(self.fps, "FPS")
         if not MIN_FPS <= self.fps <= MAX_FPS:
             raise LTXError(f"LTX FPS must be between {MIN_FPS} and {MAX_FPS}.")
@@ -90,3 +97,8 @@ class GenerationRequest:
     @property
     def duration(self) -> float:
         return self.frames / self.fps
+
+    @property
+    def first_stage_size(self) -> tuple[int, int]:
+        """(width, height) the first generation runs at."""
+        return (self.width // 2, self.height // 2) if self.two_stage else (self.width, self.height)

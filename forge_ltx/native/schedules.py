@@ -3,6 +3,9 @@
 "LTX Distilled": the sigmas the distilled checkpoints are trained on, from the ComfyUI templates (ManualSigmas, 8
 steps). At 8 steps they are exact; other step counts follow the same curve, interpolated over the step index.
 
+Two stages: the second stage refines the upscaled latent on REFINE, the templates' ManualSigmas of LTX-2.3 and 2.5
+(LTX-2.0's start at 0.909375).
+
 "LTX": ComfyUI's LTXVScheduler for the dev checkpoints: a uniform grid shifted by the latent's token count (shift
 0.95 at 1024 tokens up to 2.05 at 4096, extrapolated linearly), stretched so the last sigma before 0 is 0.1.
 """
@@ -12,6 +15,7 @@ import math
 import torch
 
 DISTILLED = (1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0)
+REFINE = {"2.0": (0.909375, 0.725, 0.421875, 0.0), "2.3": (0.85, 0.725, 0.4219, 0.0), "2.5": (0.85, 0.725, 0.4219, 0.0)}
 
 DISTILLED_NAME, DISTILLED_LABEL = "ltx_distilled", "LTX Distilled"
 DEV_NAME, DEV_LABEL = "ltx", "LTX"
@@ -77,5 +81,19 @@ def dev_override(tokens: int):
     """A sampler_noise_scheduler_override that gives LTX its shift for the request's latent token count."""
     def schedule(steps: int) -> torch.Tensor:
         return dev_sigmas(steps, tokens)
+
+    return schedule
+
+
+def refine_sigmas(version) -> tuple[float, ...]:
+    return REFINE.get(version, REFINE["2.5"])
+
+
+def refine_override(version):
+    """A sampler_noise_scheduler_override for the second stage: its fixed sigmas, whatever the step count."""
+    sigmas = refine_sigmas(version)
+
+    def schedule(steps: int) -> torch.Tensor:
+        return torch.tensor(sigmas, dtype=torch.float32)
 
     return schedule

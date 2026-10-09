@@ -43,17 +43,21 @@ class Script(scripts.Script):
     def ui(self, is_img2img):
         self.panel = ui.Panel(is_img2img)
         self.infotext_fields = [(self.panel.fps, "LTX FPS"), (self.panel.strength, "LTX Keyframe strength"),
-                                (self.panel.compression, "LTX Keyframe compression")]
+                                (self.panel.compression, "LTX Keyframe compression"), (self.panel.two_stage, "LTX Two stages")]
         return self.panel.inputs
 
-    def before_process(self, p, output="Video", include_audio=True, fps=None, strength=None, compression=None, *args):
-        integration.script_before_process(p, output, include_audio, fps, strength, compression)
+    def before_process(self, p, output="Video", include_audio=True, fps=None, strength=None, compression=None, two_stage=False,
+                       upscaler=None, *args):
+        integration.script_before_process(p, output, include_audio, fps, strength, compression, two_stage, upscaler)
 
     def process(self, p, *args):
         integration.process(p)
 
     def process_before_every_sampling(self, p, *args, **kwargs):
         integration.before_sampling(p, kwargs["noise"])
+
+    def post_sample(self, p, ps, *args):
+        ps.samples = integration.post_sample(p, ps.samples)
 
     def postprocess(self, p, processed, *args):
         integration.postprocess(p, processed)

@@ -42,6 +42,7 @@ FILES = {
         ("Lightricks/LTX-2", "ltx-2-19b-distilled.safetensors"),
         ("Lightricks/LTX-2", "ltx-2-19b-dev-fp4.safetensors"),
         ("Lightricks/LTX-2", "ltx-2-19b-distilled-lora-384.safetensors"),
+        ("Lightricks/LTX-2", "ltx-2-spatial-upscaler-x2-1.0.safetensors"),
         ("Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it.safetensors"),
         ("Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it_fp8_scaled.safetensors"),
         ("Comfy-Org/ltx-2", "split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors"),

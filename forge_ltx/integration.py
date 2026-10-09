@@ -2,14 +2,14 @@
 
 Forge loads the model (native/patches.py registers it), samples and decodes as usual. The callbacks here turn the
 Frames control into LTX's length, hand the engine its first / last frames (keyframes.py), give the sampler the packed
-video+audio noise, and write the MP4 with sound.
+video+audio noise, run the second stage of a two-stage generation, and write the MP4 with sound.
 """
 
 import json
 import uuid
 from pathlib import Path
 
-from . import keyframes
+from . import keyframes, upscalers
 from .contracts import GenerationRequest, LTXError, set_pending_error
 from .media import export_still, export_video, find_ffmpeg
 from .models import inspect_model, resolve_components
@@ -75,23 +75,26 @@ def keyframe_settings(strength, compression) -> tuple[float | None, int | None]:
     return strength, compression
 
 
-def before_process(p, output="Video", include_audio=True, fps=None, strength=None, compression=None):
+def before_process(p, output="Video", include_audio=True, fps=None, strength=None, compression=None, two_stage=False,
+                   upscaler=None):
     """Before Forge loads the model: check the request and turn Frames into a single LTX generation."""
     p.ltx_request = None
     p.ltx_last_frame = None
+    p.ltx_upscaler = None
     set_pending_error(None)
     try:
-        _before_process(p, output, include_audio, fps, strength, compression)
+        _before_process(p, output, include_audio, fps, strength, compression, two_stage, upscaler)
     except LTXError as error:
         set_pending_error(error)
         raise
 
 
-def script_before_process(p, output="Video", include_audio=True, fps=None, strength=None, compression=None, *_):
+def script_before_process(p, output="Video", include_audio=True, fps=None, strength=None, compression=None, two_stage=False,
+                          upscaler=None, *_):
     """before_process as Forge's script runner calls it: a rejected request prints one line instead of the traceback
     Forge logs for any exception; the error stays pending and stops the generation when the model is first called."""
     try:
-        before_process(p, output, include_audio, fps, strength, compression)
+        before_process(p, output, include_audio, fps, strength, compression, two_stage, upscaler)
     except LTXError as error:
         print(f"[LTX] {error}")
 
@@ -111,7 +114,7 @@ def guidance_note(dev: bool, cfg: float, scheduler) -> str | None:
     return None
 
 
-def _before_process(p, output, include_audio, fps, strength, compression):
+def _before_process(p, output, include_audio, fps, strength, compression, two_stage, upscaler):
     from modules import processing, shared
 
     from .contracts import DEFAULT_FPS
@@ -128,7 +131,9 @@ def _before_process(p, output, include_audio, fps, strength, compression):
     overrides = getattr(p, "override_settings", {})
     components = resolve_components(info.filename, module_paths(overrides.get("forge_additional_modules", shared.opts.forge_additional_modules)))
     request = GenerationRequest(width=p.width, height=p.height, frames=p.batch_size, fps=fps or DEFAULT_FPS,
-                                output=output, include_audio=include_audio)
+                                output=output, include_audio=include_audio, two_stage=bool(two_stage))
+    if request.two_stage:
+        p.ltx_upscaler = str(upscalers.resolve(upscaler, components.version))
     last = keyframes.last_frame(p, request.width, request.height)
     if last is not None and request.output != "Video":
         raise LTXError("A last frame (ImageStitch Integrated) needs Output: Video.")
@@ -148,9 +153,10 @@ def _before_process(p, output, include_audio, fps, strength, compression):
     audio = "with audio" if request.include_audio else "without audio"
     frames = " and ".join(name for name, used in (("first", is_img2img), ("last", last is not None)) if used)
     conditioning = f", {frames} frame" if frames else ""
+    stages = f", two stages from {request.first_stage_size[0]}x{request.first_stage_size[1]}" if request.two_stage else ""
     print(f"[LTX] LTX-{components.version} {'dev' if p.ltx_dev else 'distilled'} {request.output.lower()}: "
           f"{request.frames} frames at {request.width}x{request.height}, {request.fps} FPS ({request.duration:.2f} s), "
-          f"{audio}{conditioning}")
+          f"{audio}{conditioning}{stages}")
     note = guidance_note(p.ltx_dev, getattr(p, "cfg_scale", 1.0), getattr(p, "scheduler", None))
     if note:
         print(f"[LTX] {note}")
@@ -165,7 +171,8 @@ def process(p):
     from .native import schedules
     from .native.streams import SPATIAL, latent_frames
     if schedules.is_dev(getattr(p, "scheduler", None)):
-        tokens = latent_frames(request.frames) * (request.height // SPATIAL) * (request.width // SPATIAL)
+        width, height = request.first_stage_size
+        tokens = latent_frames(request.frames) * (height // SPATIAL) * (width // SPATIAL)
         p.sampler_noise_scheduler_override = schedules.dev_override(tokens)
     engine = p.sd_model
     last = getattr(p, "ltx_last_frame", None)
@@ -173,6 +180,8 @@ def process(p):
     engine.set_keyframes(keyframes.to_tensor(last) if last is not None else None, strength, compression)
     p.extra_generation_params.update({"LTX Version": getattr(p, "ltx_version", ""), "LTX Frames": request.frames,
                                       "LTX FPS": request.fps, "LTX Audio": request.include_audio, "LTX Output": request.output})
+    if request.two_stage:
+        p.extra_generation_params.update({"LTX Two stages": True, "LTX Upscaler": Path(p.ltx_upscaler).name})
     first = bool(getattr(p, "ltx_first_frame", False))
     if first or last is not None:
         p.extra_generation_params.update({"LTX First frame": first, "LTX Last frame": last is not None,
@@ -191,7 +200,8 @@ def before_sampling(p, noise):
                          "and check the console for an earlier error.")
         set_pending_error(error)
         raise error
-    shape = p.sd_model.prepare(request.frames, request.width, request.height, request.fps, int(p.seeds[0]))
+    width, height = request.first_stage_size
+    shape = p.sd_model.prepare(request.frames, width, height, request.fps, int(p.seeds[0]))
     # Forge made p.rng for an image latent; the samplers that add noise on the way (ancestral, SDE) draw from it too,
     # so it has to give the packed shape
     p.rng = rng.ImageRNG(shape, p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength,
@@ -200,6 +210,44 @@ def before_sampling(p, noise):
     if getattr(p, "init_latent", None) is not None:
         # img2img samples from init_latent at full denoise; the packed start is pure noise
         p.init_latent = torch.zeros_like(p.modified_noise)
+
+
+def post_sample(p, samples):
+    """After Forge's sampling: for two stages, the latent refined at the output size takes the first stage's place."""
+    request = getattr(p, "ltx_request", None)
+    if request is None or not request.two_stage:
+        return samples
+    from modules import shared
+    if shared.state.interrupted or shared.state.skipped:
+        return samples
+    return refine(p, samples)
+
+
+def refine(p, samples):
+    """The second stage: the first stage's latent upscaled x2, new noise (from the seed + 1, as Forge's sampler draws
+    it), and the version's refining sigmas through Forge's own img2img sampling, with the same sampler, prompt and
+    CFG."""
+    from modules import rng
+
+    from .native import schedules
+    request = p.ltx_request
+    version = getattr(p, "ltx_version", "2.5")
+    start = p.sd_model.refine_start(samples, request.width, request.height, p.ltx_upscaler)
+    seeds = [int(seed) + 1 for seed in p.seeds]
+    # the samplers that add noise on the way draw from p.rng too
+    p.rng = rng.ImageRNG(tuple(start.shape[1:]), seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength,
+                         seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
+    noise = p.rng.next()
+    start = start.to(device=noise.device, dtype=noise.dtype)
+    saved = p.sampler_noise_scheduler_override, p.denoising_strength
+    p.sampler_noise_scheduler_override = schedules.refine_override(version)
+    # with full denoise, Forge's img2img sampling runs the whole schedule it is given
+    p.denoising_strength = 1.0
+    try:
+        return p.sampler.sample_img2img(p, start, noise, p.c, p.uc, steps=len(schedules.refine_sigmas(version)) - 1,
+                                        image_conditioning=p.txt2img_image_conditioning(start))
+    finally:
+        p.sampler_noise_scheduler_override, p.denoising_strength = saved
 
 
 def postprocess(p, processed):
@@ -242,7 +290,9 @@ def _write_output(p, processed, request, generation):
     sidecar = dict(prompt=p.prompt, negative_prompt=p.negative_prompt, seed=generation.seed, width=request.width,
                    height=request.height, frames=request.frames, fps=request.fps, steps=p.steps, sampler=p.sampler_name,
                    scheduler=p.scheduler, cfg=p.cfg_scale, include_audio=request.include_audio, output=request.output,
-                   version=getattr(p, "ltx_version", ""), first_frame=bool(getattr(p, "ltx_first_frame", False)),
+                   version=getattr(p, "ltx_version", ""), two_stage=request.two_stage,
+                   upscaler=Path(p.ltx_upscaler).name if request.two_stage else None,
+                   first_frame=bool(getattr(p, "ltx_first_frame", False)),
                    last_frame=getattr(p, "ltx_last_frame", None) is not None, infotext=infotext)
     Path(output).with_suffix(".json").write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
     processed.video_path = output
