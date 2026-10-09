@@ -15,7 +15,7 @@ from backend.state_dict import load_state_dict
 from huggingface_guess import detection, model_list
 from transformers.modeling_utils import no_init_weights
 
-from . import gemma3, gemma4, model, projection, text_engine, vae
+from . import filebacked, gemma3, gemma4, model, projection, release, text_engine, vae
 from .engine import LTXEngine
 from .forge_dit import ForgeLTXAV
 
@@ -111,6 +111,17 @@ def _load_vae(state_dict: dict) -> vae.AutoencoderLTXAV:
     return pair
 
 
+def _file_backed(name: str, module, storages: set[int]) -> None:
+    # see filebacked.py: weights that return from VRAM become file views again instead of anonymous copies
+    try:
+        backed, total = filebacked.keep_file_backed(module, storages)
+    except Exception as e:
+        # the model works without it, with Forge's own copies in system RAM
+        logger.warning(f"[LTX] {name}: weights will be copied to system RAM when they leave VRAM: {e}")
+        return
+    print(f"[LTX] {name}: {backed / 2**30:.1f} of {total / 2**30:.1f} GiB stay file-backed in system RAM")
+
+
 def _text_encoder_factory(sd: dict):
     """The class Forge Neo's Gemma branch instantiates, for this state dict: our Gemma with the text projection."""
     spec = projection.detect({k: tuple(v.shape) for k, v in sd.items() if k.startswith(projection.PREFIX)})
@@ -137,8 +148,10 @@ def _load_text_encoder(guess, component_name, lib_name, repo_path, state_dict, o
     tokenizer = text_engine.gemma4_tokenizer(blob[1]) if blob[0] == "tokenizer_json" else text_engine.gemma3_tokenizer(blob[1])
 
     # Forge Neo's Gemma 2 branch: dtype, quantization (Comfy int8, fp8, GGUF) and device handling
+    storages = filebacked.file_storages(state_dict)
     with _swapped(llama, "Gemma2_2B", _text_encoder_factory(state_dict)):
         te = original(guess, component_name, lib_name, "Gemma2Model", repo_path, state_dict)
+    _file_backed("text encoder", te, storages)
     te.ltx_tokenizer = tokenizer
     print(f"[LTX] text encoder: {'Gemma 4' if isinstance(te, gemma4.Gemma4_12B) else 'Gemma 3'} 12B, "
           f"{type(te.text_embedding_projection).__name__}")
@@ -155,8 +168,10 @@ def _hook_components() -> None:
             return _load_vae(state_dict)
         if cls_name == "LTXAVTransformer3DModel":
             # the Krea 2 branch is a generic DiT load: dtype, quantization and device handling
+            storages = filebacked.file_storages(state_dict)
             with _swapped(krea, "SingleStreamDiT", ForgeLTXAV):
                 dit = original(guess, component_name, lib_name, "Krea2Transformer2DModel", repo_path, state_dict)
+            _file_backed("diffusion model", dit, storages)
             print(f"[LTX] LTX-{guess.unet_config.get('version', '?')} diffusion model, {len(dit.transformer_blocks)} blocks")
             return dit
         if cls_name == "LTXGemmaTextEncoder":
@@ -164,6 +179,35 @@ def _hook_components() -> None:
         return original(guess, component_name, lib_name, cls_name, repo_path, state_dict)
 
     loader.load_huggingface_component = load_huggingface_component
+
+
+def _hook_unload() -> None:
+    # see release.py: a replaced LTX model is emptied before Forge detaches it to system RAM
+    original = memory_management.unload_all_models
+    types = release.ltx_module_types()
+
+    def unload_all_models(*args, **kwargs):
+        try:
+            from modules import sd_models
+            if release.release_replaced(memory_management.current_loaded_models, sd_models.model_data.sd_model, types):
+                print("[LTX] released the replaced LTX model without copying it to system RAM")
+        except Exception as e:
+            logger.warning(f"[LTX] could not release the replaced LTX model early: {e}")
+        return original(*args, **kwargs)
+
+    memory_management.unload_all_models = unload_all_models
+
+    from modules import processing, sd_models
+    original_manage = processing.manage_model_and_prompt_cache
+
+    def manage_model_and_prompt_cache(p):
+        if release.reload_instead_of_unload(processing.need_global_unload, sd_models.model_data.sd_model):
+            # an emptied hash makes forge_model_reload discard LTX (see above) and load it again from disk
+            print("[LTX] settings changed: reloading LTX from disk instead of moving it to system RAM")
+            sd_models.model_data.forge_hash = ""
+        return original_manage(p)
+
+    processing.manage_model_and_prompt_cache = manage_model_and_prompt_cache
 
 
 def apply() -> None:
@@ -178,6 +222,11 @@ def apply() -> None:
         loader.possible_models = (*loader.possible_models, LTXEngine)
     _hook_replace_state_dict()
     _hook_components()
+    try:
+        _hook_unload()
+    except Exception as e:
+        # LTX still works: a replaced model goes through system RAM as any other
+        logger.warning(f"[LTX] could not hook model unloading: {e}")
 
     from . import presets, schedules
 
