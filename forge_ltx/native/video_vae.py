@@ -72,8 +72,8 @@ DECODE_MEMORY_PER_POSITION = 507 * 1024
 # a tile of Forge's tiled decode costs more per position than the whole clip: 6.46 GiB measured for a 20x20 latent
 # tile of 16 frames, 1.7 times the fit above
 DECODE_TILE_FACTOR = 1.75
-# room on top of the measurements
-DECODE_MARGIN = 1.1
+# room on top of the measurements (owner: 1.25x)
+DECODE_MARGIN = 1.25
 
 
 def max_chunk_size(device) -> int:

@@ -133,10 +133,9 @@ class ForwardTests(unittest.TestCase):
         shape, gib = (1, 128, 16, 22, 40), 1024**3
         self.assertIsNone(engine.decode_plan(model, shape, torch.bfloat16, 44 * gib))   # A40 / 48 GB
         self.assertIsNone(engine.decode_plan(model, shape, torch.bfloat16, 13 * gib))   # 16 GB card
-        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 8 * gib), 16)
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 9 * gib), 16)
         self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 6 * gib), 12)  # 8 GB card
-        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 4 * gib), 8)
-        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 2 * gib), 6)
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 4 * gib), 6)
         for tile in engine.DECODE_TILES:
             self.assertLessEqual(model.decode_memory(engine._tile_shape(shape, tile), torch.bfloat16, None, tiled=True),
                                  model.decode_memory(shape, torch.bfloat16, None))
