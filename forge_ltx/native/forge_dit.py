@@ -34,8 +34,11 @@ class ForgeLTXAV(LTXAVModel):
                                "earlier LTX message")
         if x.shape[-1] != generation.shapes.size:
             raise RuntimeError("[LTX] the latent does not belong to the current LTX generation")
-        with lora.low_rank(self):
-            return self._forward_packed(x, timestep, context, generation, transformer_options)
+        # inference mode, as Forge's encode and decode run: Never OOM's always-offload moves the weights in it, and
+        # slicing such a tensor (the AdaLN tables) outside of it fails; the sampler gets an ordinary tensor back
+        with torch.inference_mode(), lora.low_rank(self):
+            out = self._forward_packed(x, timestep, context, generation, transformer_options)
+        return out.clone() if out.is_inference() else out
 
     def _forward_packed(self, x, timestep, context, generation, transformer_options):
         shapes = generation.shapes
