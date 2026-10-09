@@ -65,10 +65,15 @@ MIN_VRAM_FOR_CHUNK_SCALING = 6 * 1024**3
 MAX_VRAM_FOR_CHUNK_SCALING = 24 * 1024**3
 MIN_CHUNK_SIZE = 32 * 1024**2
 MAX_CHUNK_SIZE = 128 * 1024**2
-# working memory of the streaming decoder in 16-bit, a base plus a share per latent position: measured on an A40
-# (session 1) at 2.04 GiB for 768x512x49 (2688 positions) and 7.34 GiB for 1280x704x121 (14080), about 20% on top
-DECODE_BASE_MEMORY = 1024**3
-DECODE_MEMORY_PER_POSITION = 560 * 1024
+# working memory of the streaming decoder in 16-bit, a base plus a share per latent position, fitted to session 1 on
+# an A40: 2.04 GiB for 768x512x49 (2688 positions), 7.34 to 7.55 GiB for 1280x704x121 (14080)
+DECODE_BASE_MEMORY = int(0.74 * 1024**3)
+DECODE_MEMORY_PER_POSITION = 507 * 1024
+# a tile of Forge's tiled decode costs more per position than the whole clip: 6.46 GiB measured for a 20x20 latent
+# tile of 16 frames, 1.7 times the fit above
+DECODE_TILE_FACTOR = 1.75
+# room on top of the measurements
+DECODE_MARGIN = 1.1
 
 
 def max_chunk_size(device) -> int:
@@ -636,13 +641,14 @@ class VideoVAE(nn.Module):
     def decode_output_shape(self, input_shape):
         return self.decoder.decode_output_shape(input_shape)
 
-    def decode_memory(self, latent_shape, dtype, device) -> int:
-        """Working memory the streaming decoder needs on device for a latent of this shape, the weights aside.
+    def decode_memory(self, latent_shape, dtype, device, tiled: bool = False) -> int:
+        """Working memory the streaming decoder needs on device for a latent (or one tile of it) of this shape, the
+        weights aside.
 
         ComfyUI reserves 1200 * F * H * W * 512 bytes per element, enough to decode the whole clip at once (17 GiB for
         five seconds of 720p); the decoder here keeps one temporal chunk per stage instead."""
         latent_positions = math.prod(latent_shape[2:]) * latent_shape[0]
-        scale = memory_management.dtype_size(dtype) / 2
+        scale = memory_management.dtype_size(dtype) / 2 * DECODE_MARGIN * (DECODE_TILE_FACTOR if tiled else 1.0)
         return int((DECODE_BASE_MEMORY + latent_positions * DECODE_MEMORY_PER_POSITION) * scale)
 
     def decode(self, x, output_buffer=None, generator=None):

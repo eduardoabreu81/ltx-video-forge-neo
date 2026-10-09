@@ -61,7 +61,8 @@ def video_vae_patcher(model, dtype) -> VAE:
     vae.downscale_index_formula = (8, 32, 32)
     # Forge's tiled decode reserves memory for the shape it is given; with a tile set, for one tile
     vae.ltx_tile = None
-    vae.memory_used_decode = lambda shape, dtype: model.decode_memory(_tile_shape(shape, vae.ltx_tile), dtype, vae.device)
+    vae.memory_used_decode = lambda shape, dtype: model.decode_memory(_tile_shape(shape, vae.ltx_tile), dtype, vae.device,
+                                                                      tiled=vae.ltx_tile is not None)
     return vae
 
 
@@ -77,7 +78,7 @@ def decode_plan(model, shape, dtype, room: int) -> int | None:
     if model.decode_memory(shape, dtype, None) <= room:
         return None
     for tile in DECODE_TILES:
-        if model.decode_memory(_tile_shape(shape, tile), dtype, None) <= room:
+        if model.decode_memory(_tile_shape(shape, tile), dtype, None, tiled=True) <= room:
             return tile
     return DECODE_TILES[-1]
 

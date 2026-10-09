@@ -133,12 +133,18 @@ class ForwardTests(unittest.TestCase):
         shape, gib = (1, 128, 16, 22, 40), 1024**3
         self.assertIsNone(engine.decode_plan(model, shape, torch.bfloat16, 44 * gib))   # A40 / 48 GB
         self.assertIsNone(engine.decode_plan(model, shape, torch.bfloat16, 13 * gib))   # 16 GB card
-        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 6 * gib), 16)  # 8 GB card
-        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 3 * gib), 8)
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 8 * gib), 16)
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 6 * gib), 12)  # 8 GB card
+        self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 4 * gib), 8)
         self.assertEqual(engine.decode_plan(model, shape, torch.bfloat16, 2 * gib), 6)
         for tile in engine.DECODE_TILES:
-            self.assertLessEqual(model.decode_memory(engine._tile_shape(shape, tile), torch.bfloat16, None),
+            self.assertLessEqual(model.decode_memory(engine._tile_shape(shape, tile), torch.bfloat16, None, tiled=True),
                                  model.decode_memory(shape, torch.bfloat16, None))
+        # the session 1 measurements stay below their reserves
+        measured = {(1, 128, 7, 16, 24): 2.04, (1, 128, 16, 22, 40): 7.55}
+        for latent, used in measured.items():
+            self.assertGreater(model.decode_memory(latent, torch.bfloat16, None) / gib, used * 1.05)
+        self.assertGreater(model.decode_memory((1, 128, 16, 20, 20), torch.bfloat16, None, tiled=True) / gib, 6.46 * 1.05)
 
     def test_audio_matches_comfyui(self):
         for version, stored in self.reference["audio"].items():
