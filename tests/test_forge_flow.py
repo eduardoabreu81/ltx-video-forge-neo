@@ -137,12 +137,16 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(self.resolve(DIT_20, GEMMA3).version, "2.0")
         self.assertEqual(self.resolve(DIT_23, GEMMA3).version, "2.3")
         self.assertEqual(self.resolve(DIT_25, GEMMA4, VIDEO_25, AUDIO_25).version, "2.5")
+        # the 2.3 checkpoint's own VAEs share their layout with LTX-2.5's files
+        self.assertEqual(self.resolve(DIT_23, GEMMA3, VIDEO_25, AUDIO_25).version, "2.3")
 
     def test_clear_errors(self):
         cases = [((DIT_25, GEMMA3, VIDEO_25, AUDIO_25), "Gemma 4"),
                  ((DIT_23, GEMMA4), "Gemma 3"),
                  ((DIT_25, GEMMA4, AUDIO_25), "video VAE"),
-                 ((DIT_25, GEMMA4, DIFFUSION_VAE_25, AUDIO_25), "not supported yet")]
+                 ((DIT_25, GEMMA4, DIFFUSION_VAE_25, AUDIO_25), "not supported yet"),
+                 ((DIT_20, GEMMA3, VIDEO_25), "does not fit LTX-2.0"),
+                 ((DIT_20, GEMMA3, AUDIO_25), "does not fit LTX-2.0")]
         for args, message in cases:
             with self.subTest(args=args), self.assertRaisesRegex(LTXError, message):
                 self.resolve(*args)

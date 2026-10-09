@@ -151,6 +151,8 @@ class ModelInfo:
     variant: str
     # an LTX-2.0 / 2.3 checkpoint carries the VAEs and the text projection; a text encoder may carry its projection
     bundled: bool = False
+    # VAEs: "2.0" or "2.3" (LTX-2.5's conv video VAE and its audio VAE share the 2.3 layout)
+    layout: str = ""
 
     @property
     def is_dev(self) -> bool:
@@ -239,8 +241,14 @@ def inspect_model(path):
         bundled = any(k.startswith("text_embedding_projection.") for k in keys)
     elif role == "video_vae":
         variant = "diffusion" if "decoder.conv_in_x_t.weight" in keys else "conv"
+    layout = ""
+    if role == "video_vae" and variant == "conv":
+        # the 2.0 decoder has 7 up blocks (native/vae.py video_layout)
+        layout = "2.0" if len({k.split(".")[2] for k in keys if k.startswith("decoder.up_blocks.")}) == 7 else "2.3"
+    elif role == "audio_vae":
+        layout = "2.3" if "vocoder.vocoder.conv_pre.weight" in keys else "2.0"
     quantization = _gguf_quantization(path, header) if suffix == ".gguf" else _quantization(header, keys)
-    return ModelInfo(path, role, quantization, variant, bundled)
+    return ModelInfo(path, role, quantization, variant, bundled, layout)
 
 
 @dataclass(frozen=True)
@@ -288,6 +296,13 @@ def resolve_components(dit_path, module_paths):
             raise LTXError(f"Select the LTX {ROLE_LABELS[role]} under VAE / Text Encoder"
                            + (": ltx-2.5-video-vae-conv-bf16." if role == "video_vae" else ": ltx-2.5-audio-vae-bf16."))
     video = resolved.get("video_vae")
+    # LTX-2.0 has its own VAEs and vocoder; LTX-2.3 and 2.5 share one layout
+    expected = "2.0" if dit.variant == "2.0" else "2.3"
+    for role in ("video_vae", "audio_vae"):
+        item = resolved.get(role)
+        if item is not None and item.layout and item.layout != expected:
+            raise LTXError(f"{item.path.name} is an LTX-{item.layout if item.layout == '2.0' else '2.3 / 2.5'} {ROLE_LABELS[role]} "
+                           f"and does not fit LTX-{dit.variant}" + (": the checkpoint carries its own, leave it out." if dit.bundled else "."))
     if video is not None and video.variant == "diffusion":
         raise LTXError("The LTX-2.5 diffusion video decoder (ltx-2.5-video-vae-bf16) is not supported yet: select "
                        "ltx-2.5-video-vae-conv-bf16 instead.")
