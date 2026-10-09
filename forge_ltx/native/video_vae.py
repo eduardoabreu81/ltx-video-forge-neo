@@ -66,9 +66,9 @@ MAX_VRAM_FOR_CHUNK_SCALING = 24 * 1024**3
 MIN_CHUNK_SIZE = 32 * 1024**2
 MAX_CHUNK_SIZE = 128 * 1024**2
 # working memory of the streaming decoder in 16-bit, a base plus a share per latent position: measured on an A40
-# (session 1) at 2.04 GiB for 768x512x49 and above 4.5 GiB for 1280x704x121, with some room on top
-DECODE_BASE_MEMORY = int(1.5 * 1024**3)
-DECODE_MEMORY_PER_POSITION = 360 * 1024
+# (session 1) at 2.04 GiB for 768x512x49 (2688 positions) and 7.34 GiB for 1280x704x121 (14080), about 20% on top
+DECODE_BASE_MEMORY = 1024**3
+DECODE_MEMORY_PER_POSITION = 560 * 1024
 
 
 def max_chunk_size(device) -> int:
