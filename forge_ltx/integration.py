@@ -1,16 +1,21 @@
-"""LTX inside Forge's own txt2img flow, through script callbacks.
+"""LTX inside Forge's own txt2img and img2img flows, through script callbacks.
 
 Forge loads the model (native/patches.py registers it), samples and decodes as usual. The callbacks here turn the
-Frames control into LTX's length, give the sampler the packed video+audio noise, and write the MP4 with sound.
+Frames control into LTX's length, hand the engine its first / last frames (keyframes.py), give the sampler the packed
+video+audio noise, and write the MP4 with sound.
 """
 
 import json
 import uuid
 from pathlib import Path
 
+from . import keyframes
 from .contracts import GenerationRequest, LTXError, set_pending_error
 from .media import export_still, export_video, find_ffmpeg
 from .models import inspect_model, resolve_components
+
+# img2img Resize mode "Just resize (latent upscale)": it would interpolate the placeholder latent
+LATENT_UPSCALE = 3
 
 
 def checkpoint_info(value):
@@ -42,15 +47,14 @@ def module_paths(values):
 
 
 def validate_processing(p):
-    from modules import processing
-    if isinstance(p, processing.StableDiffusionProcessingImg2Img):
-        raise LTXError("LTX image-to-video is not available yet: use txt2img.")
     if getattr(p, "n_iter", 1) != 1:
         raise LTXError("LTX currently supports Batch Count = 1. Frames sets the video length.")
     if getattr(p, "enable_hr", False) or getattr(p, "txt2img_upscale", False):
         raise LTXError("Disable Hires. fix for LTX generation.")
     if getattr(p, "restore_faces", False):
         raise LTXError("Disable Restore faces for LTX generation.")
+    if getattr(p, "image_mask", None) is not None:
+        raise LTXError("LTX inpainting is not available. Use the regular img2img image input as the first frame.")
     if (getattr(p, "subseed_strength", 0) > 0 or getattr(p, "seed_resize_from_w", -1) > 0
             or getattr(p, "seed_resize_from_h", -1) > 0):
         raise LTXError("Disable variation seed and seed resize for LTX.")
@@ -58,46 +62,98 @@ def validate_processing(p):
         raise LTXError("Select Script: None for LTX generation. Script combinations are not validated yet.")
 
 
-def before_process(p, output="Video", include_audio=True, fps=None):
+def keyframe_settings(strength, compression) -> tuple[float | None, int | None]:
+    """The panel's keyframe strength and compression; None (an API call that leaves them out) is the version's default."""
+    if strength is not None:
+        strength = float(strength)
+        if not 0.0 <= strength <= 1.0:
+            raise LTXError("LTX keyframe strength must be between 0 and 1.")
+    if compression is not None:
+        compression = int(compression)
+        if not 0 <= compression <= 100:
+            raise LTXError("LTX keyframe compression must be between 0 and 100.")
+    return strength, compression
+
+
+def before_process(p, output="Video", include_audio=True, fps=None, strength=None, compression=None):
     """Before Forge loads the model: check the request and turn Frames into a single LTX generation."""
     p.ltx_request = None
+    p.ltx_last_frame = None
     set_pending_error(None)
     try:
-        _before_process(p, output, include_audio, fps)
+        _before_process(p, output, include_audio, fps, strength, compression)
     except LTXError as error:
         set_pending_error(error)
         raise
 
 
-def script_before_process(p, output="Video", include_audio=True, fps=None, *_):
+def script_before_process(p, output="Video", include_audio=True, fps=None, strength=None, compression=None, *_):
     """before_process as Forge's script runner calls it: a rejected request prints one line instead of the traceback
     Forge logs for any exception; the error stays pending and stops the generation when the model is first called."""
     try:
-        before_process(p, output, include_audio, fps)
+        before_process(p, output, include_audio, fps, strength, compression)
     except LTXError as error:
         print(f"[LTX] {error}")
 
 
-def _before_process(p, output, include_audio, fps):
-    from modules import shared
+def is_distilled_schedule(scheduler) -> bool:
+    from .native import schedules
+    return scheduler in (schedules.DISTILLED_NAME, schedules.DISTILLED_LABEL)
+
+
+def guidance_note(dev: bool, cfg: float, scheduler) -> str | None:
+    """A console hint when CFG does not suit the checkpoint: distilled ones are made for CFG 1, a dev one needs CFG
+    (or the distilled LoRA, which goes with the LTX Distilled schedule)."""
+    if not dev and cfg != 1.0:
+        return f"distilled checkpoints are made for CFG 1: CFG {cfg:g} applies guidance twice and runs two passes per step"
+    if dev and cfg == 1.0 and not is_distilled_schedule(scheduler):
+        return "a dev checkpoint at CFG 1 needs the distilled LoRA (with LTX Distilled); without it use CFG 3 to 4"
+    return None
+
+
+def _before_process(p, output, include_audio, fps, strength, compression):
+    from modules import processing, shared
 
     from .contracts import DEFAULT_FPS
     info = select_ltx(p)
     if info is None:
         return
     validate_processing(p)
+    is_img2img = isinstance(p, processing.StableDiffusionProcessingImg2Img)
+    if is_img2img:
+        if not getattr(p, "init_images", None):
+            raise LTXError("Add an input image for LTX in img2img: it becomes the first frame.")
+        if getattr(p, "resize_mode", 0) == LATENT_UPSCALE:
+            raise LTXError("LTX does not take the latent upscale resize mode. Choose another Resize mode.")
     overrides = getattr(p, "override_settings", {})
     components = resolve_components(info.filename, module_paths(overrides.get("forge_additional_modules", shared.opts.forge_additional_modules)))
     request = GenerationRequest(width=p.width, height=p.height, frames=p.batch_size, fps=fps or DEFAULT_FPS,
                                 output=output, include_audio=include_audio)
+    last = keyframes.last_frame(p, request.width, request.height)
+    if last is not None and request.output != "Video":
+        raise LTXError("A last frame (ImageStitch Integrated) needs Output: Video.")
+    strength, compression = keyframe_settings(strength, compression)
     if request.output == "Video":
         find_ffmpeg(getattr(shared.opts, "ltx_ffmpeg_path", ""))
     p.ltx_request = request
     p.ltx_version = components.version
+    p.ltx_dev = components.dit.is_dev
+    p.ltx_first_frame = is_img2img
+    p.ltx_last_frame = last
+    p.ltx_keyframe_settings = (strength, compression)
     p.batch_size = 1
+    if is_img2img:
+        # LTX generates the whole clip from noise; the input image conditions it as the first frame
+        p.denoising_strength = 1.0
     audio = "with audio" if request.include_audio else "without audio"
-    print(f"[LTX] LTX-{components.version} {request.output.lower()}: {request.frames} frames at {request.width}x{request.height}, "
-          f"{request.fps} FPS ({request.duration:.2f} s), {audio}")
+    frames = " and ".join(name for name, used in (("first", is_img2img), ("last", last is not None)) if used)
+    conditioning = f", {frames} frame" if frames else ""
+    print(f"[LTX] LTX-{components.version} {'dev' if p.ltx_dev else 'distilled'} {request.output.lower()}: "
+          f"{request.frames} frames at {request.width}x{request.height}, {request.fps} FPS ({request.duration:.2f} s), "
+          f"{audio}{conditioning}")
+    note = guidance_note(p.ltx_dev, getattr(p, "cfg_scale", 1.0), getattr(p, "scheduler", None))
+    if note:
+        print(f"[LTX] {note}")
 
 
 def process(p):
@@ -111,8 +167,17 @@ def process(p):
     if schedules.is_dev(getattr(p, "scheduler", None)):
         tokens = latent_frames(request.frames) * (request.height // SPATIAL) * (request.width // SPATIAL)
         p.sampler_noise_scheduler_override = schedules.dev_override(tokens)
+    engine = p.sd_model
+    last = getattr(p, "ltx_last_frame", None)
+    strength, compression = getattr(p, "ltx_keyframe_settings", (None, None))
+    engine.set_keyframes(keyframes.to_tensor(last) if last is not None else None, strength, compression)
     p.extra_generation_params.update({"LTX Version": getattr(p, "ltx_version", ""), "LTX Frames": request.frames,
                                       "LTX FPS": request.fps, "LTX Audio": request.include_audio, "LTX Output": request.output})
+    first = bool(getattr(p, "ltx_first_frame", False))
+    if first or last is not None:
+        p.extra_generation_params.update({"LTX First frame": first, "LTX Last frame": last is not None,
+                                          "LTX Keyframe strength": engine.keyframe_strength,
+                                          "LTX Keyframe compression": engine.keyframe_compression})
 
 
 def before_sampling(p, noise):
@@ -121,6 +186,11 @@ def before_sampling(p, noise):
     request = getattr(p, "ltx_request", None)
     if request is None:
         return
+    if getattr(p, "ltx_first_frame", False) and p.sd_model.first_frame is None:
+        error = LTXError("The img2img input image did not reach LTX. Set Settings > VAE > VAE for Encoding to Full, "
+                         "and check the console for an earlier error.")
+        set_pending_error(error)
+        raise error
     shape = p.sd_model.prepare(request.frames, request.width, request.height, request.fps, int(p.seeds[0]))
     # Forge made p.rng for an image latent; the samplers that add noise on the way (ancestral, SDE) draw from it too,
     # so it has to give the packed shape
@@ -128,6 +198,7 @@ def before_sampling(p, noise):
                          seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
     p.modified_noise = p.rng.next().to(device=noise.device, dtype=noise.dtype)
     if getattr(p, "init_latent", None) is not None:
+        # img2img samples from init_latent at full denoise; the packed start is pure noise
         p.init_latent = torch.zeros_like(p.modified_noise)
 
 
@@ -171,7 +242,8 @@ def _write_output(p, processed, request, generation):
     sidecar = dict(prompt=p.prompt, negative_prompt=p.negative_prompt, seed=generation.seed, width=request.width,
                    height=request.height, frames=request.frames, fps=request.fps, steps=p.steps, sampler=p.sampler_name,
                    scheduler=p.scheduler, cfg=p.cfg_scale, include_audio=request.include_audio, output=request.output,
-                   version=getattr(p, "ltx_version", ""), infotext=infotext)
+                   version=getattr(p, "ltx_version", ""), first_frame=bool(getattr(p, "ltx_first_frame", False)),
+                   last_frame=getattr(p, "ltx_last_frame", None) is not None, infotext=infotext)
     Path(output).with_suffix(".json").write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
     processed.video_path = output
     processed.comments += f"LTX {request.output.lower()} saved to {output}\n"

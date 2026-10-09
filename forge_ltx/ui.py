@@ -5,7 +5,14 @@ import logging
 
 import gradio as gr
 
-from .contracts import DEFAULT_FPS, DEFAULT_FRAMES, MAX_FPS, MIN_FPS, LTXError
+from .contracts import (
+    DEFAULT_FPS,
+    DEFAULT_FRAMES,
+    MAX_FPS,
+    MIN_FPS,
+    LTXError,
+    keyframe_defaults,
+)
 from .integration import checkpoint_info
 from .models import ROLE_LABELS, inspect_model
 from .ui_state import duration_text, frame_view, preset_frame_view
@@ -15,10 +22,10 @@ NATIVE_CONTROLS = ("batch_size", "batch_count", "sampling", "scheduler", "cfg_sc
 PANELS = []
 logger = logging.getLogger("forge_ltx")
 
-# the distilled template of the ComfyUI LTX-2.5 workflows (presets.py)
-DEFAULT_SAMPLER = "Euler a"
-DEFAULT_SCHEDULER = "LTX Distilled"
-DEFAULT_STEPS = 8
+# sampler, schedule, steps and CFG an LTX checkpoint starts with: the distilled template of the ComfyUI LTX-2.5
+# workflows (presets.py), and for a dev checkpoint the LTX-2 dev template (20 steps, CFG 4, LTXVScheduler)
+DEFAULTS = {"distilled": ("Euler a", "LTX Distilled", 8, 1.0), "dev": ("Euler a", "LTX", 20, 4.0)}
+DEFAULT_STRENGTH, DEFAULT_COMPRESSION = keyframe_defaults("2.5")
 
 
 def _in_blocks():
@@ -48,6 +55,14 @@ class Panel:
                 self.audio = gr.Checkbox(value=True, label="Include generated audio", elem_id=f"{self.tab}_ltx_audio")
                 self.fps = gr.Slider(minimum=MIN_FPS, maximum=MAX_FPS, step=1, value=DEFAULT_FPS, label="FPS",
                                      elem_id=f"{self.tab}_ltx_fps")
+            with gr.Accordion("First and last frame", open=False):
+                gr.Markdown("In img2img the input image is the first frame; the gallery of ImageStitch Integrated "
+                            "holds the last frame (in txt2img or img2img).")
+                with gr.Row():
+                    self.strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=DEFAULT_STRENGTH, label="Frame strength",
+                                              elem_id=f"{self.tab}_ltx_keyframe_strength")
+                    self.compression = gr.Slider(minimum=0, maximum=100, step=1, value=DEFAULT_COMPRESSION, label="Image compression",
+                                                 elem_id=f"{self.tab}_ltx_keyframe_compression")
             self.status = gr.Markdown("Select the LTX text encoder (and, for LTX-2.5, both VAEs) in VAE / Text Encoder.")
             with gr.Accordion("Components", open=False):
                 self.summary = gr.Markdown("")
@@ -58,7 +73,7 @@ class Panel:
     @property
     def inputs(self):
         # the order integration.script_before_process takes
-        return [self.output, self.audio, self.fps]
+        return [self.output, self.audio, self.fps, self.strength, self.compression]
 
     @property
     def needed(self):
@@ -84,7 +99,8 @@ class Panel:
                      if hasattr(c, key)} for c in native]
         preset_input = [preset] if preset is not None else []
         inputs = [checkpoint, self.output, self.fps, modules, self.saved] + native + preset_input
-        outputs = [self.accordion, self.audio, self.fps, duration, self.status, self.summary, self.saved] + native + preset_input
+        outputs = [self.accordion, self.audio, self.fps, duration, self.status, self.summary, self.saved, self.strength,
+                   self.compression] + native + preset_input
 
         def update(value, output, fps, module_values, saved, *values):
             preset_value = values[-1] if preset is not None else None
@@ -92,14 +108,23 @@ class Panel:
             info = checkpoint_info(value)
             error = ""
             active = False
+            kind = version = None
             if info:
                 try:
                     item = inspect_model(info.filename)
                     active = item is not None and item.role == "dit"
+                    kind = "dev" if active and item.is_dev else "distilled"
+                    version = item.variant if active else None
                 except LTXError as exc:
                     error = str(exc)
             saved = dict(saved or {"active": False})
             entering = active and not saved.get("active")
+            # a dev checkpoint after a distilled one (or the other way) gets its own sampling defaults
+            switching = active and not entering and saved.get("kind") != kind
+            keyframe_updates = [gr.update(), gr.update()]
+            if active and (entering or saved.get("version") != version):
+                # each LTX version has its own keyframe recipe (contracts.KEYFRAME_DEFAULTS)
+                keyframe_updates = [gr.update(value=value) for value in keyframe_defaults(version)]
             leaving = not active and saved.get("active")
             if entering:
                 saved["native"] = [dict(config, value=value) for config, value in zip(defaults, values)]
@@ -114,15 +139,18 @@ class Panel:
                 updates[0] = gr.update(**view)
                 frames = view["value"]
                 updates[1] = gr.update(value=1, visible=False)
-                if entering:
-                    updates[2] = gr.update(value=DEFAULT_SAMPLER)
-                    updates[3] = gr.update(value=DEFAULT_SCHEDULER)
-                    updates[4] = gr.update(value=1.0)
-                    updates[5] = gr.update(value=DEFAULT_STEPS)
+                if entering or switching:
+                    sampler, scheduler, steps, cfg = DEFAULTS[kind]
+                    updates[2] = gr.update(value=sampler)
+                    updates[3] = gr.update(value=scheduler)
+                    updates[4] = gr.update(value=cfg)
+                    updates[5] = gr.update(value=steps)
             elif leaving:
                 updates = [gr.update(**config) for config in saved.get("native", [])]
                 saved.pop("native", None)
             saved["active"] = active
+            saved["kind"] = kind if active else None
+            saved["version"] = version if active else None
             summary = ""
             if active:
                 try:
@@ -143,7 +171,7 @@ class Panel:
                                                        if video else "Still image is a one-frame LTX generation.")
             return [gr.update(visible=active), gr.update(visible=active and video), gr.update(visible=active and video),
                     gr.update(value=duration_text(frames, fps) if active else "", visible=active and video), status, summary,
-                    saved] + updates + ([gr.update()] if preset is not None else [])
+                    saved] + keyframe_updates + updates + ([gr.update()] if preset is not None else [])
 
         for event in (checkpoint.change, self.output.change, modules.change):
             event(update, inputs=inputs, outputs=outputs, queue=False, show_progress=False)

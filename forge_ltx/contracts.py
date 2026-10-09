@@ -15,6 +15,13 @@ MIN_SIZE = 64
 DEFAULT_FPS = 24
 MIN_FPS = 1
 MAX_FPS = 60
+# first / last frame strength and image compression of the ComfyUI templates: LTX-2.0 stamps its image at full
+# strength with compression 33, LTX-2.3 and 2.5 at 0.7 with compression 18
+KEYFRAME_DEFAULTS = {"2.0": (1.0, 33), "2.3": (0.7, 18), "2.5": (0.7, 18)}
+
+
+def keyframe_defaults(version) -> tuple[float, int]:
+    return KEYFRAME_DEFAULTS.get(version, KEYFRAME_DEFAULTS["2.5"])
 
 
 class LTXError(RuntimeError):

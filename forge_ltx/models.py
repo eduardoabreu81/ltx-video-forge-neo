@@ -1,6 +1,7 @@
 """Read only safetensors headers; never deserialize a checkpoint to discover it."""
 
 import json
+import re
 import struct
 from dataclasses import dataclass
 from functools import lru_cache
@@ -150,6 +151,17 @@ class ModelInfo:
     variant: str
     # an LTX-2.0 / 2.3 checkpoint carries the VAEs and the text projection; a text encoder may carry its projection
     bundled: bool = False
+
+    @property
+    def is_dev(self) -> bool:
+        """A dev (undistilled) diffusion model. The headers of dev and distilled files are alike, so the file name
+        tells them apart, as Lightricks and the community name them; only the panel's defaults depend on it."""
+        return self.role == "dit" and is_dev_name(self.path.name)
+
+
+def is_dev_name(name: str) -> bool:
+    words = set(re.split(r"[^a-z0-9]+", name.lower()))
+    return "dev" in words and not any(w.startswith("distill") for w in words)
 
 
 def _role(keys):

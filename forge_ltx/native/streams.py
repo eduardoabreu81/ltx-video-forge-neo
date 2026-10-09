@@ -51,8 +51,9 @@ class StreamShapes:
         return flat[:, :n].reshape(b, *self.video[1:]), flat[:, n:].reshape(b, *self.audio[1:])
 
 
-def stream_shapes(frames: int, width: int, height: int, fps: float) -> StreamShapes:
-    return StreamShapes(video=(1, LATENT_CHANNELS, latent_frames(frames), height // SPATIAL, width // SPATIAL),
+def stream_shapes(frames: int, width: int, height: int, fps: float, guide_frames: int = 0) -> StreamShapes:
+    """The two latents of a clip; guide_frames latent frames are appended to the video for keyframe guides."""
+    return StreamShapes(video=(1, LATENT_CHANNELS, latent_frames(frames) + guide_frames, height // SPATIAL, width // SPATIAL),
                         audio=(1, AUDIO_CHANNELS, audio_latents(frames, fps), AUDIO_FREQUENCY_BINS))
 
 
@@ -74,6 +75,8 @@ class Generation:
     frames: int
     # the DiT runs the text through its connectors once per prompt; filled on the first step
     contexts: dict = field(default_factory=dict)
+    # first / last frame conditioning (guides.Conditioning), None for text-to-video
+    conditioning: object = None
     decoded: torch.Tensor | None = None   # [T, 3, H, W] float in [0, 1], after decoding
     waveform: torch.Tensor | None = None  # [2, samples] float in [-1, 1], after decoding
     sample_rate: int = 0

@@ -42,11 +42,12 @@ class Script(scripts.Script):
 
     def ui(self, is_img2img):
         self.panel = ui.Panel(is_img2img)
-        self.infotext_fields = [(self.panel.fps, "LTX FPS")]
+        self.infotext_fields = [(self.panel.fps, "LTX FPS"), (self.panel.strength, "LTX Keyframe strength"),
+                                (self.panel.compression, "LTX Keyframe compression")]
         return self.panel.inputs
 
-    def before_process(self, p, output="Video", include_audio=True, fps=None, *args):
-        integration.script_before_process(p, output, include_audio, fps)
+    def before_process(self, p, output="Video", include_audio=True, fps=None, strength=None, compression=None, *args):
+        integration.script_before_process(p, output, include_audio, fps, strength, compression)
 
     def process(self, p, *args):
         integration.process(p)
