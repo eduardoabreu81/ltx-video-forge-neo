@@ -101,6 +101,31 @@ class ForwardTests(unittest.TestCase):
                 torch.testing.assert_close(stored["chunked"]["latent"], stored["whole"]["latent"], rtol=1e-4, atol=1e-4)
                 torch.testing.assert_close(stored["chunked"]["decoded"], stored["whole"]["decoded"], rtol=1e-4, atol=1e-4)
 
+    def test_tiled_decode_through_forge(self):
+        # Never OOM's tiled decode goes through Forge's own VAE object: one tile has to give the plain decode, more
+        # tiles the same clip shape (the tiny model's random weights make the seams differ)
+        import types
+
+        from forge_ltx.native import engine
+        stored = self.reference["video"]["2.5"]
+        with using_forge_operations(device=torch.device("cpu"), dtype=torch.float32):
+            model = video_vae.VideoVAE(stored["config"])
+        self.load(model, stored["state_dict"])
+        model.config = types.SimpleNamespace(z_dim=128, latent_channels=128)  # as vae.AutoencoderLTXAV sets it
+        vae = engine.video_vae_patcher(model, torch.float32)
+        latent = torch.randn(1, 128, 3, 4, 6)
+        with torch.inference_mode():  # as decode_first_stage runs
+            plain = model.decode(latent.clone())[0].add(1.0).mul(0.5).clamp(0.0, 1.0).movedim(1, 0)
+            owner = types.SimpleNamespace(forge_objects=types.SimpleNamespace(vae=vae))
+            with mock.patch.object(engine, "DECODE_TILE", 8), mock.patch.object(engine, "DECODE_TILE_OVERLAP", 1):
+                whole = engine.LTXEngine._decode_tiled(owner, latent.clone())
+            with mock.patch.object(engine, "DECODE_TILE", 3), mock.patch.object(engine, "DECODE_TILE_OVERLAP", 1):
+                tiled = engine.LTXEngine._decode_tiled(owner, latent.clone())
+        self.assertEqual(tuple(whole.shape), (17, 3, 128, 192))
+        torch.testing.assert_close(whole, plain, rtol=1e-4, atol=1e-4)
+        self.assertEqual(tiled.shape, whole.shape)
+        self.assertTrue(torch.isfinite(tiled).all())
+
     def test_audio_matches_comfyui(self):
         for version, stored in self.reference["audio"].items():
             with self.subTest(version=version), torch.no_grad():

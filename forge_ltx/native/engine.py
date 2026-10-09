@@ -26,6 +26,9 @@ TEXT_MEMORY_PER_TOKEN = 3 * 1024 * 1024
 MIN_TEXT_TOKENS = 642
 # ComfyUI's estimate for the audio VAE and the vocoder (sd.py, "LTX Audio"), per latent element in fp32
 AUDIO_MEMORY_PER_ELEMENT = 87000 * 4
+# tiled video decode, in latent units: ComfyUI's LTX tiled decode uses 512-pixel tiles with 64 pixels of overlap
+DECODE_TILE = 16
+DECODE_TILE_OVERLAP = 2
 
 
 def encode_memory(pixel_shape, dtype) -> int:
@@ -36,6 +39,20 @@ def encode_memory(pixel_shape, dtype) -> int:
 def _video_vae_dtype() -> torch.dtype:
     # ComfyUI runs the LTX video VAE in bf16 or fp32
     return memory_management.vae_dtype(allowed_dtypes=[torch.bfloat16, torch.float32])
+
+
+def video_vae_patcher(model, dtype) -> VAE:
+    """Forge's VAE object around the LTX video VAE, with what its tiled decode (Never OOM, and the fallback after an
+    out-of-memory error) needs to know about the LTX latent: 8x in time after the first frame, 32x in space (ComfyUI
+    sd.py, lightricks ltxv)."""
+    vae = VAE(model=model, dtype=dtype, is_wan=True)
+    vae.latent_channels = 128
+    vae.upscale_ratio = (lambda a: max(0, a * 8 - 7), 32, 32)
+    vae.upscale_index_formula = (8, 32, 32)
+    vae.downscale_ratio = (lambda a: max(0, (a + 7) // 8), 32, 32)
+    vae.downscale_index_formula = (8, 32, 32)
+    vae.memory_used_decode = lambda shape, dtype: model.decode_memory(shape, dtype, vae.device)
+    return vae
 
 
 @contextlib.contextmanager
@@ -62,8 +79,7 @@ class LTXEngine(ForgeDiffusionEngine):
         clip = CLIP(model_dict={TEXT_ENCODER: text_encoder}, tokenizer_dict={TEXT_ENCODER: text_encoder.ltx_tokenizer})
 
         pair = huggingface_components["vae"]
-        vae = VAE(model=pair.video, dtype=_video_vae_dtype(), is_wan=True)
-        vae.latent_channels = 128
+        vae = video_vae_patcher(pair.video, _video_vae_dtype())
         # the audio VAE and the vocoder in fp32, as ComfyUI keeps them
         self.audio_vae = VAE(model=pair.audio, dtype=torch.float32, is_wan=True)
 
@@ -160,6 +176,38 @@ class LTXEngine(ForgeDiffusionEngine):
         self.first_frame = x[:1].float().mul(0.5).add(0.5).clamp(0.0, 1.0).movedim(1, -1).cpu()
         return torch.zeros((1, 1, 1, 1), device=x.device)
 
+    def _decode_video(self, video: torch.Tensor) -> torch.Tensor:
+        """Frames [T, 3, H, W] in [0, 1] from the video latent. The whole clip at once, streaming through time; Never
+        OOM's "always tiled" VAE switch, or running out of memory twice, takes Forge's own tiled decode instead."""
+        video_vae = self.forge_objects.vae
+        if memory_management.VAE_ALWAYS_TILED:
+            return self._decode_tiled(video)
+        reserve = video_vae.first_stage_model.decode_memory(video.shape, video_vae.vae_dtype, video_vae.device)
+        for attempt in range(2):
+            try:
+                memory_management.load_models_gpu([video_vae.patcher], memory_required=reserve)
+                with _peak_memory("video decode", video_vae.device, reserve):
+                    pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))  # [1, 3, T, H, W] in [-1, 1]
+                return pixels[0].float().add(1.0).mul(0.5).clamp(0.0, 1.0).cpu().movedim(1, 0)
+            except Exception as e:
+                if not memory_management.is_oom(e):
+                    raise
+                pixels = None
+                memory_management.soft_empty_cache(force=True)
+                if attempt == 0:
+                    # the estimate fell short: the DiT and the text encoder leave VRAM (they reload from their files)
+                    print(f"[LTX] video decode ran out of memory with {reserve / 2**30:.2f} GiB reserved: retrying with the other models unloaded")
+                    memory_management.unload_all_models()
+                    reserve *= 2
+        print("[LTX] video decode ran out of memory again: decoding in tiles")
+        return self._decode_tiled(video)
+
+    def _decode_tiled(self, video: torch.Tensor) -> torch.Tensor:
+        video_vae = self.forge_objects.vae
+        print(f"[LTX] video decode in tiles of {DECODE_TILE * 32} pixels")
+        frames = video_vae.decode_tiled(video, tile_x=DECODE_TILE, tile_y=DECODE_TILE, overlap=DECODE_TILE_OVERLAP)  # [1, T, H, W, 3] in [0, 1]
+        return frames[0].float().clamp(0.0, 1.0).cpu().movedim(-1, 1)
+
     @torch.inference_mode()
     def decode_first_stage(self, x: torch.Tensor):
         generation = self.generation
@@ -170,23 +218,8 @@ class LTXEngine(ForgeDiffusionEngine):
             # the appended guide frames are not part of the clip (ComfyUI LTXVCropGuides)
             video = video[:, :, :video.shape[2] - generation.conditioning.guide_frames]
 
-        video_vae = self.forge_objects.vae
-        reserve = video_vae.first_stage_model.decode_memory(video.shape, video_vae.vae_dtype, video_vae.device)
-        memory_management.load_models_gpu([video_vae.patcher], memory_required=reserve)
-        try:
-            with _peak_memory("video decode", video_vae.device, reserve):
-                pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))  # [1, 3, F, H, W] in [-1, 1]
-        except torch.OutOfMemoryError:
-            # the estimate fell short: the DiT and the text encoder leave VRAM (they reload from their files) and the
-            # decode runs once more with the whole card
-            print(f"[LTX] video decode ran out of memory with {reserve / 2**30:.2f} GiB reserved: retrying with the other models unloaded")
-            memory_management.unload_all_models()
-            memory_management.soft_empty_cache(force=True)
-            memory_management.load_models_gpu([video_vae.patcher], memory_required=reserve * 2)
-            with _peak_memory("video decode (retry)", video_vae.device, reserve * 2):
-                pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))
-        generation.decoded = pixels[0].float().add(1.0).mul(0.5).clamp(0.0, 1.0).cpu().movedim(1, 0)
-        del pixels
+        generation.decoded = self._decode_video(video)
+
 
         memory_management.load_models_gpu([self.audio_vae.patcher], memory_required=audio.shape[2] * audio.shape[3] * AUDIO_MEMORY_PER_ELEMENT)
         audio_model = self.audio_vae.first_stage_model
