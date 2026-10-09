@@ -65,11 +65,10 @@ MIN_VRAM_FOR_CHUNK_SCALING = 6 * 1024**3
 MAX_VRAM_FOR_CHUNK_SCALING = 24 * 1024**3
 MIN_CHUNK_SIZE = 32 * 1024**2
 MAX_CHUNK_SIZE = 128 * 1024**2
-# working memory of the decoder, in chunks: an upsampling block turns a chunk into up to 4x its size, next to its
-# input and its residual path (first estimate, to be measured on the GPU: the engine logs the real peak)
-DECODE_CHUNK_FACTOR = 12
-# activations of the blocks that run on the whole clip at the latent resolution, in tensors of conv_in's width
-DECODE_LATENT_FACTOR = 4
+# working memory of the streaming decoder in 16-bit, a base plus a share per latent position: measured on an A40
+# (session 1) at 2.04 GiB for 768x512x49 and above 4.5 GiB for 1280x704x121, with some room on top
+DECODE_BASE_MEMORY = int(1.5 * 1024**3)
+DECODE_MEMORY_PER_POSITION = 360 * 1024
 
 
 def max_chunk_size(device) -> int:
@@ -643,9 +642,8 @@ class VideoVAE(nn.Module):
         ComfyUI reserves 1200 * F * H * W * 512 bytes per element, enough to decode the whole clip at once (17 GiB for
         five seconds of 720p); the decoder here keeps one temporal chunk per stage instead."""
         latent_positions = math.prod(latent_shape[2:]) * latent_shape[0]
-        latent = latent_positions * self.decoder.conv_in.out_channels * DECODE_LATENT_FACTOR
-        size = memory_management.dtype_size(dtype)
-        return int(latent * size + max_chunk_size(device) * DECODE_CHUNK_FACTOR)
+        scale = memory_management.dtype_size(dtype) / 2
+        return int((DECODE_BASE_MEMORY + latent_positions * DECODE_MEMORY_PER_POSITION) * scale)
 
     def decode(self, x, output_buffer=None, generator=None):
         if self.timestep_conditioning:

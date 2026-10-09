@@ -173,8 +173,18 @@ class LTXEngine(ForgeDiffusionEngine):
         video_vae = self.forge_objects.vae
         reserve = video_vae.first_stage_model.decode_memory(video.shape, video_vae.vae_dtype, video_vae.device)
         memory_management.load_models_gpu([video_vae.patcher], memory_required=reserve)
-        with _peak_memory("video decode", video_vae.device, reserve):
-            pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))  # [1, 3, F, H, W] in [-1, 1]
+        try:
+            with _peak_memory("video decode", video_vae.device, reserve):
+                pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))  # [1, 3, F, H, W] in [-1, 1]
+        except torch.OutOfMemoryError:
+            # the estimate fell short: the DiT and the text encoder leave VRAM (they reload from their files) and the
+            # decode runs once more with the whole card
+            print(f"[LTX] video decode ran out of memory with {reserve / 2**30:.2f} GiB reserved: retrying with the other models unloaded")
+            memory_management.unload_all_models()
+            memory_management.soft_empty_cache(force=True)
+            memory_management.load_models_gpu([video_vae.patcher], memory_required=reserve * 2)
+            with _peak_memory("video decode (retry)", video_vae.device, reserve * 2):
+                pixels = video_vae.first_stage_model.decode(video.to(video_vae.device, video_vae.vae_dtype))
         generation.decoded = pixels[0].float().add(1.0).mul(0.5).clamp(0.0, 1.0).cpu().movedim(1, 0)
         del pixels
 
