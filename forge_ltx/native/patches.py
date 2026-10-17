@@ -4,6 +4,7 @@ Every hook hands anything that is not LTX-2.x to the original Forge Neo function
 """
 
 import contextlib
+import functools
 import logging
 
 import torch
@@ -161,6 +162,9 @@ def _load_text_encoder(guess, component_name, lib_name, repo_path, state_dict, o
 def _hook_components() -> None:
     original = loader.load_huggingface_component
 
+    # wraps leaves __wrapped__ behind, which inspect.getsource follows: the compat checks of the other extensions
+    # that read Forge's loader source still reach it through this hook
+    @functools.wraps(original)
     def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_path, state_dict):
         if not isinstance(guess, model.LTXAV):
             return original(guess, component_name, lib_name, cls_name, repo_path, state_dict)
