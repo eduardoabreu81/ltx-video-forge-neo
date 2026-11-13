@@ -77,9 +77,11 @@ def _hook_detection() -> None:
 def _hook_replace_state_dict() -> None:
     original = loader.replace_state_dict
 
-    def replace_state_dict(sd: dict, asd: dict, guess, path):
+    def replace_state_dict(sd: dict, asd: dict, *rest):
+        # Forge Neo calls (sd, asd, guess, path), and (sd, asd, metadata, guess, path) once its GGUF update lands
+        guess = rest[-2]
         if not isinstance(guess, model.LTXAV):
-            return original(sd, asd, guess, path)
+            return original(sd, asd, *rest)
         if is_gemma(asd):
             # ahead of Forge Neo's own Gemma 2 rule, which asserts the Gemma 2 layout
             _replace(sd, (model.TEXT_PREFIX,), asd, model.TEXT_PREFIX)
@@ -93,7 +95,7 @@ def _hook_replace_state_dict() -> None:
         elif vae.is_audio_vae(asd):
             _replace(sd, ("audio_vae.", "vocoder.", "vae.audio."), asd)
         else:
-            return original(sd, asd, guess, path)
+            return original(sd, asd, *rest)
         return sd
 
     loader.replace_state_dict = replace_state_dict
