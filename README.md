@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/banner.jpg" alt="LTX Video for Forge Neo banner"/>
+</p>
+
 # 🎬 LTX Video for Forge Neo
 
 <div align="center">
